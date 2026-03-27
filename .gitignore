@@ -1,0 +1,4 @@
+instances.db
+*.pyc
+__pycache__/
+.env
