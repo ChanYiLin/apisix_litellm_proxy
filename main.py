@@ -8,7 +8,7 @@ from models import ChatCompletionRequest
 
 litellm.drop_params = True
 
-app = FastAPI(title="LiteLLM Bedrock Proxy")
+app = FastAPI(title="LiteLLM Multi-Provider Proxy")
 
 _OPTIONAL_PARAMS = [
     "temperature", "max_tokens", "top_p", "stop",
@@ -33,6 +33,48 @@ async def admin_reload():
     return {"status": "cache reloaded"}
 
 
+def _build_litellm_kwargs(cfg: dict, body: ChatCompletionRequest) -> dict:
+    provider = cfg["provider"]
+    kwargs: dict = {
+        "messages": [m.model_dump(exclude_none=True) for m in body.messages],
+        "stream": body.stream or False,
+    }
+
+    match provider:
+        case "bedrock":
+            kwargs.update({
+                "model":           f"bedrock/{cfg['model_id']}",
+                "api_base":        cfg["bedrock_base_url"],
+                "api_key":         cfg["bedrock_api_key"],
+                "aws_region_name": cfg["aws_region_name"],
+            })
+        case "gemini":
+            kwargs.update({
+                "model":   f"gemini/{cfg['model_id']}",
+                "api_key": cfg["gemini_api_key"],
+            })
+            if cfg.get("gemini_api_base"):
+                kwargs["api_base"] = cfg["gemini_api_base"]
+        case "vertex_ai":
+            kwargs.update({
+                "model":              f"vertex_ai/{cfg['model_id']}",
+                "vertex_project":     cfg["vertex_project"],
+                "vertex_location":    cfg["vertex_location"],
+                "vertex_credentials": cfg["vertex_credentials"],
+            })
+            if cfg.get("vertex_api_base"):
+                kwargs["api_base"] = cfg["vertex_api_base"]
+        case _:
+            raise ValueError(f"Unknown provider: {provider}")
+
+    for param in _OPTIONAL_PARAMS:
+        val = getattr(body, param, None)
+        if val is not None:
+            kwargs[param] = val
+
+    return kwargs
+
+
 @app.post("/v1/chat/completions")
 async def chat_completions(
     body: ChatCompletionRequest,
@@ -42,19 +84,7 @@ async def chat_completions(
         raise HTTPException(status_code=400, detail="Missing X-LiteLLM-Instance header")
 
     cfg = await get_instance_config(x_litellm_instance)
-
-    litellm_kwargs = {
-        "model": f"bedrock/{cfg['model_id']}",
-        "messages": [m.model_dump(exclude_none=True) for m in body.messages],
-        "stream": body.stream or False,
-        "api_base": cfg["bedrock_base_url"],
-        "api_key": cfg["api_key"],
-        "aws_region_name": cfg["aws_region_name"],
-    }
-    for param in _OPTIONAL_PARAMS:
-        val = getattr(body, param, None)
-        if val is not None:
-            litellm_kwargs[param] = val
+    litellm_kwargs = _build_litellm_kwargs(cfg, body)
 
     try:
         response = await litellm.acompletion(**litellm_kwargs)

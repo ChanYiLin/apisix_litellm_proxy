@@ -12,14 +12,43 @@ DB_NAME = os.environ.get("DB_NAME", "litellm")
 
 _cache: dict[str, dict] = {}
 
+# DEPRECATED: bedrock_instances is superseded by llm_instances.
+# _CREATE_TABLE_BEDROCK = """
+# CREATE TABLE IF NOT EXISTS bedrock_instances (
+#     instance_name    VARCHAR(255) PRIMARY KEY,
+#     aws_region_name  VARCHAR(100) NOT NULL,
+#     bedrock_base_url TEXT NOT NULL,
+#     api_key          TEXT NOT NULL,
+#     model_id         VARCHAR(255) NOT NULL DEFAULT 'anthropic.claude-sonnet-4-5-20250929-v1:0',
+#     is_active        TINYINT(1) NOT NULL DEFAULT 1,
+#     created_at       DATETIME NOT NULL DEFAULT NOW(),
+#     updated_at       DATETIME NOT NULL DEFAULT NOW()
+# )
+# """
+
 _CREATE_TABLE = """
-CREATE TABLE IF NOT EXISTS bedrock_instances (
+CREATE TABLE IF NOT EXISTS llm_instances (
     instance_name    VARCHAR(255) PRIMARY KEY,
-    aws_region_name  VARCHAR(100) NOT NULL,
-    bedrock_base_url TEXT NOT NULL,
-    api_key          TEXT NOT NULL,
-    model_id         VARCHAR(255) NOT NULL DEFAULT 'anthropic.claude-sonnet-4-5-20250929-v1:0',
+    provider         ENUM('bedrock', 'gemini', 'vertex_ai') NOT NULL,
+    model_id         VARCHAR(255) NOT NULL,
+    display_model    VARCHAR(255) NOT NULL,
     is_active        TINYINT(1) NOT NULL DEFAULT 1,
+
+    -- Bedrock fields (required when provider='bedrock')
+    aws_region_name  VARCHAR(100),
+    bedrock_base_url TEXT,
+    bedrock_api_key  TEXT,
+
+    -- Gemini AI Studio fields (required when provider='gemini')
+    gemini_api_key   TEXT,
+    gemini_api_base  TEXT,
+
+    -- Vertex AI fields (required when provider='vertex_ai')
+    vertex_project     VARCHAR(255),
+    vertex_location    VARCHAR(100),
+    vertex_credentials TEXT,
+    vertex_api_base    TEXT,
+
     created_at       DATETIME NOT NULL DEFAULT NOW(),
     updated_at       DATETIME NOT NULL DEFAULT NOW()
 )
@@ -52,7 +81,7 @@ async def reload_cache() -> None:
     conn = await _connect()
     try:
         async with conn.cursor() as cur:
-            await cur.execute("SELECT * FROM bedrock_instances WHERE is_active = 1")
+            await cur.execute("SELECT * FROM llm_instances WHERE is_active = 1")
             rows = await cur.fetchall()
     finally:
         conn.close()
@@ -69,7 +98,7 @@ async def get_instance_config(instance_name: str) -> dict:
     try:
         async with conn.cursor() as cur:
             await cur.execute(
-                "SELECT * FROM bedrock_instances WHERE instance_name = %s AND is_active = 1",
+                "SELECT * FROM llm_instances WHERE instance_name = %s AND is_active = 1",
                 (instance_name,),
             )
             row = await cur.fetchone()

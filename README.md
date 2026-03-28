@@ -1,6 +1,6 @@
-# LiteLLM Bedrock Proxy
+# LiteLLM Multi-Provider Proxy
 
-透過 APISIX AI Gateway + LiteLLM，將 OpenAI-compatible 的 `/v1/chat/completions` 請求路由到 AWS Bedrock Claude 模型，支援多 region 備援、自動 failover、串流回應。
+透過 APISIX AI Gateway + LiteLLM，將 OpenAI-compatible 的 `/v1/chat/completions` 請求路由到多種 LLM 雲端服務（AWS Bedrock、Google AI Studio、Google Vertex AI），支援多 region 備援、自動 failover、串流回應。
 
 ---
 
@@ -8,31 +8,45 @@
 
 ```
 Client
-  │  POST /v1/chat/completions
+  │  POST /v1/chat/completions  {"model": "gemini-2.0-flash", ...}
   ▼
 APISIX (port 9080)
+  │  per-model route matching（vars: post_arg_model）
   │  ai-proxy-multi plugin
-  │  • roundrobin 負載均衡（多 region）
+  │  • roundrobin 負載均衡（多 region / 多 instance）
   │  • 自動 failover（429 / 5xx）
   │  • 注入 X-LiteLLM-Instance header
   ▼
 Python LiteLLM Proxy（port 8000）
-  │  讀取 X-LiteLLM-Instance → 查 MariaDB
+  │  讀取 X-LiteLLM-Instance → 查 MariaDB（llm_instances 表）
+  │  依 provider 組出對應 litellm 參數
   │  呼叫 litellm.acompletion()
   ▼
-AWS Bedrock（VPC Endpoint）
-  各 region 的 bedrock-runtime endpoint
+LLM Provider
+  ├── AWS Bedrock（bedrock-runtime endpoint，Bearer token 認證）
+  ├── Google AI Studio（generativelanguage.googleapis.com，API Key）
+  └── Google Vertex AI（aiplatform.googleapis.com，Service Account OAuth2）
 ```
 
 ### 元件
 
 | 元件 | 角色 |
 |------|------|
-| **APISIX 3.x** | API Gateway，負責流量分配與 failover |
-| **ai-proxy-multi plugin** | 多 upstream 負載均衡，支援 priority + fallback strategy |
-| **Python FastAPI Server** | 查詢 instance mapping，呼叫 litellm |
-| **LiteLLM** | 統一 LLM 呼叫介面，處理 Bedrock API 格式轉換與 Bearer token 認證 |
-| **MariaDB 11** | 儲存各 instance 的 Bedrock endpoint URL、API Key、model ID |
+| **APISIX 3.x** | API Gateway，依 `model` 欄位路由至對應 upstream，負責 failover |
+| **ai-proxy-multi plugin** | 多 instance 負載均衡，支援 priority + fallback strategy |
+| **Python FastAPI Server** | 查詢 instance 設定，依 provider 組出 litellm 參數 |
+| **LiteLLM** | 統一 LLM 呼叫介面，處理各 provider 的 API 格式轉換與認證 |
+| **MariaDB 11** | 儲存各 instance 的 provider、endpoint、credentials、model ID |
+
+---
+
+## 支援的 Provider
+
+| Provider | `model` 值範例 | 認證方式 | 備援策略 |
+|----------|--------------|---------|---------|
+| AWS Bedrock | `claude-sonnet-4-5` | Bearer token（API Key） | 多 region（US / AP） |
+| Google AI Studio | `gemini-2.0-flash`、`gemini-2.5-pro` | API Key | 單一全球端點 |
+| Google Vertex AI | `vertex/gemini-2.0-flash` | Service Account JSON（OAuth2） | 多 region（US / Asia） |
 
 ---
 
@@ -40,19 +54,19 @@ AWS Bedrock（VPC Endpoint）
 
 ```
 litellm_proxy/
-├── main.py                  # FastAPI server（route handlers）
+├── main.py                  # FastAPI server（route handlers + _build_litellm_kwargs）
 ├── db.py                    # MariaDB 存取層 + 記憶體快取
 ├── models.py                # Pydantic request models
 ├── init_db.py               # DB 初始化腳本（建 schema + seed data）
 ├── requirements.txt
 ├── Dockerfile
-├── docker-compose.yml       # APISIX + etcd + litellm-proxy
+├── docker-compose.yml       # APISIX + etcd + litellm-proxy + mariadb
 ├── .gitignore
 ├── design.md                # 完整系統設計文件
 └── apisix/
     ├── config.yaml          # APISIX 全域設定
     └── routes/
-        └── setup-route.sh   # 建立 APISIX route 的腳本
+        └── setup-route.sh   # 建立 APISIX per-model routes 的腳本
 ```
 
 ---
@@ -62,28 +76,40 @@ litellm_proxy/
 ### 前置需求
 
 - Docker & Docker Compose
-- AWS Bedrock API Key（Bearer token）
+- 至少一種 provider 的憑證（Bedrock API Key、Gemini API Key 或 GCP Service Account JSON）
 
-### 1. 設定 Bedrock API Key
+### 1. 設定憑證
 
-編輯 `init_db.py`，將 seed data 中的 `REPLACE_ME_*` 換成真實的 Bedrock API Key：
+編輯 `init_db.py`，將 seed data 中的 `REPLACE_ME_*` 替換為真實憑證：
 
+**Bedrock：**
 ```python
-# init_db.py
-_SEED_ROWS = [
-    {
-        "instance_name": "bedrock-us-east-1",
-        "bedrock_base_url": "https://bedrock-runtime.us-east-1.amazonaws.com",
-        "api_key": "your-actual-bedrock-api-key-us-east-1",
-        ...
-    },
+{
+    "instance_name":   "bedrock-us-east-1",
+    "bedrock_api_key": "your-bedrock-bearer-token",
+    "bedrock_base_url": "https://bedrock-runtime.us-east-1.amazonaws.com",
     ...
-]
+}
 ```
 
-若使用 VPC Endpoint，將 `bedrock_base_url` 替換為 VPC endpoint 的 base URL，例如：
+**Gemini AI Studio：**
+```python
+{
+    "instance_name":  "gemini-flash-global",
+    "gemini_api_key": "AIza...",
+    ...
+}
 ```
-https://vpce-xxxxxxxxxxxx-xxxxxxxx.bedrock-runtime.us-east-1.vpce.amazonaws.com
+
+**Vertex AI：**
+```python
+{
+    "instance_name":      "vertex-flash-us",
+    "vertex_project":     "my-gcp-project",
+    "vertex_location":    "us-central1",
+    "vertex_credentials": '{"type":"service_account","project_id":"...","private_key":"..."}',
+    ...
+}
 ```
 
 ### 2. 啟動服務
@@ -94,7 +120,7 @@ docker-compose up -d
 
 服務啟動順序：etcd + mariadb → litellm-proxy → apisix
 
-### 3. 建立 APISIX Route
+### 3. 建立 APISIX Routes
 
 等待 APISIX 啟動完成後（約 15–30 秒），執行：
 
@@ -104,28 +130,43 @@ docker-compose up -d
 
 成功會印出：
 ```
-[OK] bedrock-chat-completion route created
+[OK] bedrock-claude-sonnet-4-5 route created
+[OK] gemini-2-0-flash route created
+[OK] gemini-2-5-pro route created
+[OK] vertex-gemini-2-0-flash route created
 [OK] health route created
 ```
 
 ### 4. 測試
 
-**Non-streaming：**
+**Bedrock Claude（non-streaming）：**
 ```bash
 curl -X POST http://localhost:9080/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
+    "model": "claude-sonnet-4-5",
     "messages": [{"role": "user", "content": "Hello, who are you?"}]
   }'
 ```
 
-**Streaming：**
+**Gemini AI Studio（streaming）：**
 ```bash
 curl -X POST http://localhost:9080/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
+    "model": "gemini-2.0-flash",
     "messages": [{"role": "user", "content": "Tell me a joke"}],
     "stream": true
+  }'
+```
+
+**Vertex AI：**
+```bash
+curl -X POST http://localhost:9080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "vertex/gemini-2.0-flash",
+    "messages": [{"role": "user", "content": "你好"}]
   }'
 ```
 
@@ -146,8 +187,8 @@ OpenAI-compatible Chat Completions endpoint。
 
 | 欄位 | 類型 | 說明 |
 |------|------|------|
+| `model` | string | **必填**。決定路由目標（見支援的 Provider 表）|
 | `messages` | array | 必填。對話歷史 |
-| `model` | string | 選填。由 APISIX 覆寫，可忽略 |
 | `stream` | boolean | 選填。`true` 啟用 SSE streaming |
 | `temperature` | float | 選填 |
 | `max_tokens` | int | 選填 |
@@ -162,11 +203,11 @@ OpenAI-compatible Chat Completions endpoint。
 
 ### `GET /health`
 
-回傳 `{"status": "ok"}`，供 APISIX 與 Docker healthcheck 使用。
+回傳 `{"status": "ok"}`。
 
 ### `POST /admin/reload`
 
-重新從 MariaDB 載入 instance 設定到記憶體快取。更新 DB 後不需重啟 server，呼叫此 endpoint 即可生效。
+重新從 MariaDB 載入 instance 設定到記憶體快取。更新 DB 後不需重啟 server：
 
 ```bash
 curl -X POST http://localhost:8000/admin/reload
@@ -174,55 +215,58 @@ curl -X POST http://localhost:8000/admin/reload
 
 ---
 
-## Instance Mapping（MariaDB）
+## Instance Mapping（MariaDB `llm_instances`）
 
 資料存在 MariaDB `litellm` 資料庫（Docker volume `mariadb-data`）。
 
-**Schema：**
+**Schema 共用欄位：**
 
 | 欄位 | 類型 | 說明 |
 |------|------|------|
-| `instance_name` | `VARCHAR(255) PK` | 唯一識別名稱，對應 APISIX config 中的 `X-LiteLLM-Instance` header 值 |
-| `aws_region_name` | `VARCHAR(100)` | AWS region，例如 `us-east-1` |
-| `bedrock_base_url` | `TEXT` | Bedrock runtime base URL（不含 `/model/...`） |
-| `api_key` | `TEXT` | Bedrock API Key（Bearer token） |
-| `model_id` | `VARCHAR(255)` | Bedrock model ID，例如 `anthropic.claude-sonnet-4-5-20250929-v1:0` |
+| `instance_name` | `VARCHAR(255) PK` | 唯一識別名稱，對應 APISIX 注入的 `X-LiteLLM-Instance` header 值 |
+| `provider` | `ENUM` | `bedrock` / `gemini` / `vertex_ai` |
+| `model_id` | `VARCHAR(255)` | Provider-specific model ID，litellm 實際使用 |
+| `display_model` | `VARCHAR(255)` | Client 送的 model 名稱，APISIX `post_arg_model` 匹配用 |
 | `is_active` | `TINYINT(1)` | `1` = 啟用，`0` = 停用 |
 
-**新增 instance：**
-```sql
-INSERT IGNORE INTO bedrock_instances (instance_name, aws_region_name, bedrock_base_url, api_key, model_id)
-VALUES ('bedrock-eu-west-1', 'eu-west-1', 'https://bedrock-runtime.eu-west-1.amazonaws.com', 'your-key', 'anthropic.claude-sonnet-4-5-20250929-v1:0');
-```
+**Provider-specific 欄位：**
 
-新增後需同步更新 APISIX route（在 `setup-route.sh` 加入對應 instance）並執行，以及呼叫 `POST /admin/reload` 刷新快取。
+| Provider | 欄位 | 說明 |
+|---------|------|------|
+| `bedrock` | `aws_region_name`, `bedrock_base_url`, `bedrock_api_key` | Bedrock Bearer token 認證 |
+| `gemini` | `gemini_api_key`, `gemini_api_base`（可選） | Google AI Studio API Key |
+| `vertex_ai` | `vertex_project`, `vertex_location`, `vertex_credentials`, `vertex_api_base`（可選） | GCP SA JSON + region |
 
 ---
 
 ## APISIX 流量設計
 
-### 負載均衡
+### Per-model Route 匹配
 
-`ai-proxy-multi` 使用 `roundrobin` 算法，搭配 `priority` 控制主備關係：
+每個 route 使用 `vars: [["post_arg_model", "==", "<model>"]]` 匹配 request body 的 `model` 欄位，路由到對應的 `ai-proxy-multi` 設定：
 
-| Instance | weight | priority | 角色 |
-|----------|--------|----------|------|
-| `bedrock-us-east-1` | 5 | 1 | 主要（優先接流量） |
-| `bedrock-ap-northeast-1` | 5 | 0 | 備援（主要失敗時啟用） |
+| Route ID | 匹配 `model` 值 | Instances | Failover |
+|---|---|---|---|
+| `bedrock-claude-sonnet-4-5` | `claude-sonnet-4-5` | bedrock-us-east-1（priority 1）, bedrock-ap-northeast-1（priority 0） | 是 |
+| `gemini-2-0-flash` | `gemini-2.0-flash` | gemini-flash-global | 否 |
+| `gemini-2-5-pro` | `gemini-2.5-pro` | gemini-pro-global | 否 |
+| `vertex-gemini-2-0-flash` | `vertex/gemini-2.0-flash` | vertex-flash-us（priority 1）, vertex-flash-asia（priority 0） | 是 |
 
 ### Failover 條件
 
 `fallback_strategy: ["rate_limiting", "http_5xx"]`
 
-- Bedrock 回 `429 Too Many Requests` → 自動切換到下一個 instance
-- Bedrock 回 `5xx` → 自動切換到下一個 instance
+- Provider 回 `429 Too Many Requests` → 自動切換到下一個 instance
+- Provider 回 `5xx` → 自動切換到下一個 instance
 
-### 新增 region
+---
 
-1. 在 SQLite 新增一筆 `bedrock_instances`
-2. 在 `setup-route.sh` 的 `instances` 陣列加入新 instance（設定對應的 `X-LiteLLM-Instance` header 值與 priority/weight）
+## 新增 Provider / Model
+
+1. `INSERT INTO llm_instances`（指定 `provider`、`display_model`、對應 credentials 欄位）
+2. 在 `setup-route.sh` 新增一個 route block，`vars` 條件填 `display_model` 值
 3. 重新執行 `./apisix/routes/setup-route.sh`
-4. 呼叫 `POST /admin/reload`
+4. `POST http://localhost:8000/admin/reload`
 
 ---
 
@@ -243,19 +287,23 @@ VALUES ('bedrock-eu-west-1', 'eu-west-1', 'https://bedrock-runtime.eu-west-1.ama
 
 ## 技術細節
 
-### litellm 的 Bedrock 認證
+### litellm provider 對照
 
-本專案使用 Bedrock API Key（Bearer token）認證，**不需要** IAM access key / secret key。
+| Provider | litellm model prefix | 認證參數 | 端點 |
+|---------|---------------------|---------|------|
+| `bedrock` | `bedrock/{model_id}` | `api_key`（Bearer token） | Bedrock runtime endpoint |
+| `gemini` | `gemini/{model_id}` | `api_key`（API Key，放 URL query param） | `generativelanguage.googleapis.com` |
+| `vertex_ai` | `vertex_ai/{model_id}` | `vertex_credentials`（SA JSON → OAuth2） | `{location}-aiplatform.googleapis.com` |
 
-當 `api_key` 傳入時，litellm 直接設定 `Authorization: Bearer {api_key}` header，**完全跳過 SigV4 簽名流程**（源碼：`litellm/llms/bedrock/base_aws_llm.py:get_request_headers()`）。
+### Gemini vs Vertex AI 認證差異
 
-### VPC Endpoint URL 構建
+- **Gemini AI Studio**：API Key 直接可用，不需 OAuth。litellm 用 `gemini/` prefix，key 放 URL query param。
+- **Vertex AI**：強制 OAuth2，**不接受** API Key。需傳 Service Account JSON（`vertex_credentials`），litellm 內部用 google-auth 取 Bearer token。
 
-`api_base` 只需傳入 base URL，litellm 自動附加路徑：
+### Bedrock `api_base` 只傳 base URL
 
+`bedrock_base_url` 存 **不含 `/model/...` 的 base URL**。litellm 自動附加路徑：
 ```
 {api_base}/model/{model_id}/converse          # non-streaming
 {api_base}/model/{model_id}/converse-stream   # streaming
 ```
-
-源碼：`litellm/llms/bedrock/chat/converse_handler.py:352-363`

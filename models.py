@@ -14,7 +14,7 @@ class ChatMessage(BaseModel):
 
 class ChatCompletionRequest(BaseModel):
     messages: List[ChatMessage]
-    model: Optional[str] = "bedrock/anthropic.claude-sonnet-4-5-20250929-v1:0"
+    model: Optional[str] = "claude-sonnet-4-5"
     temperature: Optional[float] = None
     max_tokens: Optional[int] = None
     top_p: Optional[float] = None
