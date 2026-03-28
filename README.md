@@ -17,7 +17,7 @@ APISIX (port 9080)
   │  • 注入 X-LiteLLM-Instance header
   ▼
 Python LiteLLM Proxy（port 8000）
-  │  讀取 X-LiteLLM-Instance → 查 SQLite
+  │  讀取 X-LiteLLM-Instance → 查 MariaDB
   │  呼叫 litellm.acompletion()
   ▼
 AWS Bedrock（VPC Endpoint）
@@ -32,7 +32,7 @@ AWS Bedrock（VPC Endpoint）
 | **ai-proxy-multi plugin** | 多 upstream 負載均衡，支援 priority + fallback strategy |
 | **Python FastAPI Server** | 查詢 instance mapping，呼叫 litellm |
 | **LiteLLM** | 統一 LLM 呼叫介面，處理 Bedrock API 格式轉換與 Bearer token 認證 |
-| **SQLite** | 儲存各 instance 的 Bedrock endpoint URL、API Key、model ID |
+| **MariaDB 11** | 儲存各 instance 的 Bedrock endpoint URL、API Key、model ID |
 
 ---
 
@@ -41,7 +41,7 @@ AWS Bedrock（VPC Endpoint）
 ```
 litellm_proxy/
 ├── main.py                  # FastAPI server（route handlers）
-├── db.py                    # SQLite 存取層 + 記憶體快取
+├── db.py                    # MariaDB 存取層 + 記憶體快取
 ├── models.py                # Pydantic request models
 ├── init_db.py               # DB 初始化腳本（建 schema + seed data）
 ├── requirements.txt
@@ -92,7 +92,7 @@ https://vpce-xxxxxxxxxxxx-xxxxxxxx.bedrock-runtime.us-east-1.vpce.amazonaws.com
 docker-compose up -d
 ```
 
-服務啟動順序：etcd → litellm-proxy → apisix
+服務啟動順序：etcd + mariadb → litellm-proxy → apisix
 
 ### 3. 建立 APISIX Route
 
@@ -166,7 +166,7 @@ OpenAI-compatible Chat Completions endpoint。
 
 ### `POST /admin/reload`
 
-重新從 SQLite 載入 instance 設定到記憶體快取。更新 DB 後不需重啟 server，呼叫此 endpoint 即可生效。
+重新從 MariaDB 載入 instance 設定到記憶體快取。更新 DB 後不需重啟 server，呼叫此 endpoint 即可生效。
 
 ```bash
 curl -X POST http://localhost:8000/admin/reload
@@ -174,28 +174,28 @@ curl -X POST http://localhost:8000/admin/reload
 
 ---
 
-## Instance Mapping（SQLite）
+## Instance Mapping（MariaDB）
 
-資料存在 `instances.db`（Docker volume `litellm-data`）。
+資料存在 MariaDB `litellm` 資料庫（Docker volume `mariadb-data`）。
 
 **Schema：**
 
-| 欄位 | 說明 |
-|------|------|
-| `instance_name` | 唯一識別名稱，對應 APISIX config 中的 `X-LiteLLM-Instance` header 值 |
-| `aws_region_name` | AWS region，例如 `us-east-1` |
-| `bedrock_base_url` | Bedrock runtime base URL（不含 `/model/...`） |
-| `api_key` | Bedrock API Key（Bearer token） |
-| `model_id` | Bedrock model ID，例如 `anthropic.claude-sonnet-4-5-20250929-v1:0` |
-| `is_active` | `1` = 啟用，`0` = 停用 |
+| 欄位 | 類型 | 說明 |
+|------|------|------|
+| `instance_name` | `VARCHAR(255) PK` | 唯一識別名稱，對應 APISIX config 中的 `X-LiteLLM-Instance` header 值 |
+| `aws_region_name` | `VARCHAR(100)` | AWS region，例如 `us-east-1` |
+| `bedrock_base_url` | `TEXT` | Bedrock runtime base URL（不含 `/model/...`） |
+| `api_key` | `TEXT` | Bedrock API Key（Bearer token） |
+| `model_id` | `VARCHAR(255)` | Bedrock model ID，例如 `anthropic.claude-sonnet-4-5-20250929-v1:0` |
+| `is_active` | `TINYINT(1)` | `1` = 啟用，`0` = 停用 |
 
 **新增 instance：**
 ```sql
-INSERT INTO bedrock_instances (instance_name, aws_region_name, bedrock_base_url, api_key, model_id)
+INSERT IGNORE INTO bedrock_instances (instance_name, aws_region_name, bedrock_base_url, api_key, model_id)
 VALUES ('bedrock-eu-west-1', 'eu-west-1', 'https://bedrock-runtime.eu-west-1.amazonaws.com', 'your-key', 'anthropic.claude-sonnet-4-5-20250929-v1:0');
 ```
 
-新增後需同步更新 APISIX route（在 `setup-route.sh` 加入對應 instance）並執行，以及呼叫 `/admin/reload` 刷新快取。
+新增後需同步更新 APISIX route（在 `setup-route.sh` 加入對應 instance）並執行，以及呼叫 `POST /admin/reload` 刷新快取。
 
 ---
 
@@ -230,7 +230,11 @@ VALUES ('bedrock-eu-west-1', 'eu-west-1', 'https://bedrock-runtime.eu-west-1.ama
 
 | 變數 | 預設值 | 說明 |
 |------|--------|------|
-| `DB_PATH` | `instances.db` | SQLite 檔案路徑 |
+| `DB_HOST` | `localhost` | MariaDB 主機名稱 |
+| `DB_PORT` | `3306` | MariaDB 連接埠 |
+| `DB_USER` | `litellm` | MariaDB 使用者名稱 |
+| `DB_PASSWORD` | _(空)_ | MariaDB 密碼 |
+| `DB_NAME` | `litellm` | MariaDB 資料庫名稱 |
 | `APISIX_ADMIN_KEY` | `edd1c9f034335f136f87ad84b625c8f1` | APISIX Admin API key |
 | `APISIX_ADMIN_URL` | `http://localhost:9180` | APISIX Admin API URL |
 | `LITELLM_PROXY_URL` | `http://litellm-proxy:8000` | Python server URL（供 APISIX 設定使用） |

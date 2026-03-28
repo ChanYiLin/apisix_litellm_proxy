@@ -1,24 +1,28 @@
 """
-Run once to initialise the SQLite DB and insert seed data.
+Run once to initialise the MariaDB schema and insert seed data.
 Usage: python init_db.py
 """
 import asyncio
 import os
 
-import aiosqlite
+import aiomysql
 
-DB_PATH = os.environ.get("DB_PATH", "instances.db")
+DB_HOST = os.environ.get("DB_HOST", "localhost")
+DB_PORT = int(os.environ.get("DB_PORT", "3306"))
+DB_USER = os.environ.get("DB_USER", "litellm")
+DB_PASSWORD = os.environ.get("DB_PASSWORD", "")
+DB_NAME = os.environ.get("DB_NAME", "litellm")
 
 _CREATE_TABLE = """
 CREATE TABLE IF NOT EXISTS bedrock_instances (
-    instance_name    TEXT PRIMARY KEY,
-    aws_region_name  TEXT NOT NULL,
+    instance_name    VARCHAR(255) PRIMARY KEY,
+    aws_region_name  VARCHAR(100) NOT NULL,
     bedrock_base_url TEXT NOT NULL,
     api_key          TEXT NOT NULL,
-    model_id         TEXT NOT NULL DEFAULT 'anthropic.claude-sonnet-4-5-20250929-v1:0',
-    is_active        INTEGER NOT NULL DEFAULT 1,
-    created_at       TEXT NOT NULL DEFAULT (datetime('now')),
-    updated_at       TEXT NOT NULL DEFAULT (datetime('now'))
+    model_id         VARCHAR(255) NOT NULL DEFAULT 'anthropic.claude-sonnet-4-5-20250929-v1:0',
+    is_active        TINYINT(1) NOT NULL DEFAULT 1,
+    created_at       DATETIME NOT NULL DEFAULT NOW(),
+    updated_at       DATETIME NOT NULL DEFAULT NOW()
 )
 """
 
@@ -41,28 +45,38 @@ _SEED_ROWS = [
 
 
 async def main() -> None:
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(_CREATE_TABLE)
-        await db.commit()
-        print(f"Table created (or already exists) in {DB_PATH}")
+    conn = await aiomysql.connect(
+        host=DB_HOST,
+        port=DB_PORT,
+        user=DB_USER,
+        password=DB_PASSWORD,
+        db=DB_NAME,
+        cursorclass=aiomysql.DictCursor,
+        autocommit=True,
+    )
+    try:
+        async with conn.cursor() as cur:
+            await cur.execute(_CREATE_TABLE)
+            print(f"Table created (or already exists) in {DB_NAME}")
 
-        for row in _SEED_ROWS:
-            await db.execute(
-                """
-                INSERT OR IGNORE INTO bedrock_instances
-                    (instance_name, aws_region_name, bedrock_base_url, api_key, model_id)
-                VALUES (?, ?, ?, ?, ?)
-                """,
-                (
-                    row["instance_name"],
-                    row["aws_region_name"],
-                    row["bedrock_base_url"],
-                    row["api_key"],
-                    row["model_id"],
-                ),
-            )
-            await db.commit()
-            print(f"  Inserted (or skipped existing): {row['instance_name']}")
+            for row in _SEED_ROWS:
+                await cur.execute(
+                    """
+                    INSERT IGNORE INTO bedrock_instances
+                        (instance_name, aws_region_name, bedrock_base_url, api_key, model_id)
+                    VALUES (%s, %s, %s, %s, %s)
+                    """,
+                    (
+                        row["instance_name"],
+                        row["aws_region_name"],
+                        row["bedrock_base_url"],
+                        row["api_key"],
+                        row["model_id"],
+                    ),
+                )
+                print(f"  Inserted (or skipped existing): {row['instance_name']}")
+    finally:
+        conn.close()
 
     print("Done.")
 

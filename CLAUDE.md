@@ -20,7 +20,7 @@
 
 ### 1. APISIX → Python Server 的 instance 識別
 
-APISIX 的 `ai-proxy-multi` plugin 透過 `auth.header` 注入 `X-LiteLLM-Instance: {instance_name}` header。Python server 讀取此 header 後查詢 SQLite，取得對應的 `bedrock_base_url`、`api_key`、`model_id`。
+APISIX 的 `ai-proxy-multi` plugin 透過 `auth.header` 注入 `X-LiteLLM-Instance: {instance_name}` header。Python server 讀取此 header 後查詢 MariaDB，取得對應的 `bedrock_base_url`、`api_key`、`model_id`。
 
 **不使用 path-based routing**（例如 `/v1/chat/completions/bedrock-us-east-1`），因為這樣 client 端的 path 就需要知道 instance 名稱。
 
@@ -57,26 +57,26 @@ DB 的 `bedrock_base_url` 存 **不含 `/model/...` 的 base URL**（例如 `htt
 | 檔案 | 職責 |
 |------|------|
 | `main.py` | FastAPI app。啟動時呼叫 `init_db()`。處理 `/v1/chat/completions`、`/health`、`/admin/reload` |
-| `db.py` | SQLite 存取 + 記憶體快取（`_cache` dict）。`init_db()` 建表並載入快取；`reload_cache()` 重新載入；`get_instance_config()` 查快取再 fallback DB |
+| `db.py` | MariaDB 存取 + 記憶體快取（`_cache` dict）。`init_db()` 建表並載入快取；`reload_cache()` 重新載入；`get_instance_config()` 查快取再 fallback DB |
 | `models.py` | `ChatMessage`、`ChatCompletionRequest` Pydantic models，`extra="allow"` 讓未知欄位通過 |
-| `init_db.py` | 獨立腳本，建 schema + INSERT OR IGNORE seed data。Docker CMD 在啟動 uvicorn 前先執行此腳本 |
+| `init_db.py` | 獨立腳本，建 schema + INSERT IGNORE seed data。Docker CMD 在啟動 uvicorn 前先執行此腳本 |
 | `apisix/config.yaml` | APISIX 全域設定，啟用 `ai-proxy-multi` 等 plugins |
 | `apisix/routes/setup-route.sh` | 用 APISIX Admin API 建立 `/v1/chat/completions` route，可透過環境變數 `APISIX_ADMIN_KEY`、`APISIX_ADMIN_URL`、`LITELLM_PROXY_URL` 覆寫預設值 |
 
 ---
 
-## DB Schema
+## DB Schema（MariaDB）
 
 ```sql
 CREATE TABLE IF NOT EXISTS bedrock_instances (
-    instance_name    TEXT PRIMARY KEY,
-    aws_region_name  TEXT NOT NULL,
-    bedrock_base_url TEXT NOT NULL,  -- base URL, 不含 /model/...
-    api_key          TEXT NOT NULL,  -- Bedrock Bearer token
-    model_id         TEXT NOT NULL DEFAULT 'anthropic.claude-sonnet-4-5-20250929-v1:0',
-    is_active        INTEGER NOT NULL DEFAULT 1,
-    created_at       TEXT NOT NULL DEFAULT (datetime('now')),
-    updated_at       TEXT NOT NULL DEFAULT (datetime('now'))
+    instance_name    VARCHAR(255) PRIMARY KEY,
+    aws_region_name  VARCHAR(100) NOT NULL,
+    bedrock_base_url TEXT NOT NULL,          -- base URL, 不含 /model/...
+    api_key          TEXT NOT NULL,          -- Bedrock Bearer token
+    model_id         VARCHAR(255) NOT NULL DEFAULT 'anthropic.claude-sonnet-4-5-20250929-v1:0',
+    is_active        TINYINT(1) NOT NULL DEFAULT 1,
+    created_at       DATETIME NOT NULL DEFAULT NOW(),
+    updated_at       DATETIME NOT NULL DEFAULT NOW()
 )
 ```
 
@@ -84,7 +84,7 @@ CREATE TABLE IF NOT EXISTS bedrock_instances (
 
 ## 新增 Region 的完整流程
 
-1. 在 SQLite 新增一筆 `bedrock_instances`（直接 INSERT 或修改 `init_db.py`）
+1. 在 MariaDB 新增一筆 `bedrock_instances`（直接 INSERT 或修改 `init_db.py`）
 2. 在 `setup-route.sh` 的 `instances` 陣列加入新 instance，設定：
    - `name`: 與 `instance_name` 相同
    - `auth.header.X-LiteLLM-Instance`: 與 `instance_name` 相同
@@ -96,7 +96,7 @@ CREATE TABLE IF NOT EXISTS bedrock_instances (
 
 ## 已知限制與未來改進方向
 
-- **憑證安全**：`api_key` 目前明文存 SQLite（MVP 用）。生產環境應從 AWS Secrets Manager 讀取，DB 只存 secret name。
+- **憑證安全**：`api_key` 目前明文存 MariaDB（MVP 用）。生產環境應從 AWS Secrets Manager 讀取，DB 只存 secret name。MariaDB 密碼透過 docker-compose env 傳入，生產環境應改用 Docker secrets 或外部 secret manager。
 - **快取一致性**：`_cache` 為模組級 dict，若多 worker 部署（`uvicorn --workers N`）需改用外部快取（Redis）。目前單 worker 無此問題。
 - **APISIX auth.header 的自定義 header**：設計上假設 `ai-proxy-multi` 的 `auth.header` 可以夾帶任意 header（包含 `X-LiteLLM-Instance`）。若實測發現只有 `Authorization` 有效，備案是改用 path-based routing：每個 instance 的 `override.endpoint` 改為 `http://litellm-proxy:8000/v1/chat/completions/{instance_name}`，server 端改成 path parameter。
 - **Streaming 中的 error handling**：streaming 中途若 Bedrock 出錯，目前 generator 會靜默結束。可考慮在 `_stream_generator` 加 try/except，yield 一個 error event。
@@ -106,7 +106,9 @@ CREATE TABLE IF NOT EXISTS bedrock_instances (
 ## 開發注意事項
 
 - Python 版本：3.11+（`dict[str, dict]` 型別語法需要 3.9+）
-- 所有 DB 操作都是 async（`aiosqlite`），不可在 async context 中用 sync 方式呼叫
+- 所有 DB 操作都是 async（`aiomysql`），不可在 async context 中用 sync 方式呼叫
+- MariaDB 連線參數透過環境變數設定：`DB_HOST`、`DB_PORT`、`DB_USER`、`DB_PASSWORD`、`DB_NAME`
+- SQL 佔位符使用 `%s`（MySQL 格式），**非** SQLite 的 `?`
 - `litellm.drop_params = True` 已在 module level 設定，不支援的參數會被靜默丟棄
 - APISIX 的 `ai-proxy-multi` 使用 `options.model` 覆寫 client 傳來的 model，但 Python server 會忽略它，改用 DB 查到的 `model_id`
 - 目前 target model 固定為 `anthropic.claude-sonnet-4-5-20250929-v1:0`（Claude Sonnet 4.5）
